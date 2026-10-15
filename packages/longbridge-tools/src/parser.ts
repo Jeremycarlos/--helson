@@ -72,23 +72,20 @@ export function parseQuoteResponse(output: string): Quote {
 
     const lastPrice = toNumber(data.last_price ?? data.last, 'last price');
     const prevClose = toNumber(data.prev_close, 'previous close');
-    const change = data.change === undefined
-      ? lastPrice - prevClose
-      : toNumber(data.change, 'change');
-    const changeRatio = data.change_ratio === undefined
-      ? prevClose === 0 ? 0 : change / prevClose
-      : toNumber(data.change_ratio, 'change ratio');
+    const change = toOptionalNumber(data.change) ?? (lastPrice - prevClose);
+    const changeRatio =
+      toOptionalNumber(data.change_ratio) ?? (prevClose === 0 ? 0 : change / prevClose);
 
     return {
       symbol: data.symbol,
       lastPrice,
       change,
       changePercent: changeRatio * 100,
-      volume: toNumber(data.volume ?? 0, 'volume'),
+      volume: toOptionalNumber(data.volume) ?? 0,
       timestamp: toTimestamp(data.timestamp),
-      high: toNumber(data.high ?? lastPrice, 'high'),
-      low: toNumber(data.low ?? lastPrice, 'low'),
-      open: toNumber(data.open ?? lastPrice, 'open'),
+      high: toOptionalNumber(data.high) ?? lastPrice,
+      low: toOptionalNumber(data.low) ?? lastPrice,
+      open: toOptionalNumber(data.open) ?? lastPrice,
       prevClose,
     };
   } catch (e) {
@@ -269,7 +266,10 @@ export function parseNewsResponse(output: string): NewsItem[] {
       title: entry.title,
       summary: '',
       url: entry.url ?? `https://longbridge.cn/news/${entry.id}`,
-      timestamp: toTimestamp(entry.published_at),
+      // A news item may legitimately omit its date; falling back to "now" is
+      // the documented tradeoff — better than rejecting the whole feed, and
+      // never presented as market data (issue #184).
+      timestamp: toEpochSeconds(entry.published_at) ?? Math.floor(Date.now() / 1000),
       symbols: [],
     }));
   } catch (e) {
@@ -277,32 +277,59 @@ export function parseNewsResponse(output: string): NewsItem[] {
   }
 }
 
+/**
+ * Optional numeric field. Accepts finite numbers and trimmed numeric strings
+ * only; anything else (missing, `null`, blank, booleans, arrays, garbage) has
+ * no value and callers apply their documented fallback. Coercing through
+ * `Number()` used to fabricate values out of non-numbers — `Number(null)` and
+ * `Number([])` are 0, `Number(true)` is 1 (issue #184).
+ */
 function toOptionalNumber(value: unknown): number | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(numberValue)) return undefined;
-  return numberValue;
-}
-
-function toNumber(value: unknown, field: string): number {
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(numberValue)) {
-    throw new Error(`Invalid ${field}`);
-  }
-  return numberValue;
-}
-
-function toTimestamp(value: unknown): number {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : undefined;
   }
   if (typeof value === 'string') {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) {
-      return Math.floor(parsed / 1000);
-    }
+    const trimmed = value.trim();
+    if (trimmed === '') return undefined;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : undefined;
   }
-  return Math.floor(Date.now() / 1000);
+  return undefined;
+}
+
+/**
+ * Required numeric field. Fail-closed: missing, `null`, blank, boolean or
+ * array values throw instead of being coerced — `Number(null)` is 0, so a
+ * `prev_close: null` used to surface as a real 0 price (issue #184).
+ */
+function toNumber(value: unknown, field: string): number {
+  if (typeof value === 'number') {
+    if (Number.isFinite(value)) return value;
+    throw new Error(`Invalid ${field}`);
+  }
+  if (typeof value === 'string') {
+    // The CLI writes an empty string for a value it does not have; `Number('')`
+    // is 0, so without this the "no value" marker was reported as a real 0.
+    const trimmed = value.trim();
+    const parsed = trimmed === '' ? Number.NaN : Number(trimmed);
+    if (Number.isFinite(parsed)) return parsed;
+    throw new Error(`Invalid ${field}`);
+  }
+  throw new Error(`Invalid ${field}`);
+}
+
+/**
+ * Strict timestamp for required fields, delegating to `toEpochSeconds` so the
+ * CLI's shapes (epoch seconds as number or numeric string, `YYYY.MM.DD`, ISO
+ * dates) all parse; missing/unparseable values throw instead of being
+ * fabricated as the current time (issue #184).
+ */
+function toTimestamp(value: unknown): number {
+  const parsed = toEpochSeconds(value);
+  if (parsed === undefined) {
+    throw new Error('Invalid timestamp');
+  }
+  return parsed;
 }
 
 // ── Phase-2 parsers ────────────────────────────────────────────────────────
@@ -330,7 +357,7 @@ export function parseDepthResponse(output: string): Depth {
       position: toNumber(l.position, 'position'),
       price: toNumber(l.price, 'price'),
       volume: toNumber(l.volume, 'volume'),
-      orderNum: toNumber(l.order_num ?? 0, 'order_num'),
+      orderNum: toOptionalNumber(l.order_num) ?? 0,
     });
     return {
       symbol: data.symbol,
@@ -388,9 +415,9 @@ export function parseCapitalFlowResponse(output: string): CapitalFlow {
       throw new Error('Capital flow response is empty');
     }
     const side = (s?: RawCapitalFlowSide): CapitalFlowSide => ({
-      large: toNumber(s?.large ?? 0, 'large'),
-      medium: toNumber(s?.medium ?? 0, 'medium'),
-      small: toNumber(s?.small ?? 0, 'small'),
+      large: toOptionalNumber(s?.large) ?? 0,
+      medium: toOptionalNumber(s?.medium) ?? 0,
+      small: toOptionalNumber(s?.small) ?? 0,
     });
     return {
       symbol: data.symbol,
@@ -417,10 +444,10 @@ export function parseMarketTemperatureResponse(output: string): MarketTemperatur
     const field = (name: string) => items.find((i) => i.field === name)?.value ?? '';
     return {
       market: field('Market') || 'US',
-      temperature: toNumber(field('Temperature'), 'temperature'),
+      temperature: toOptionalNumber(field('Temperature')) ?? 0,
       description: field('Description'),
-      valuation: toNumber(field('Valuation'), 'valuation'),
-      sentiment: toNumber(field('Sentiment'), 'sentiment'),
+      valuation: toOptionalNumber(field('Valuation')) ?? 0,
+      sentiment: toOptionalNumber(field('Sentiment')) ?? 0,
     };
   } catch (e) {
     throw parseFailure('market-temp', output);
@@ -481,8 +508,8 @@ export function parseFinancialReportResponse(output: string, fallbackSymbol = ''
           values: (acc.values ?? []).map((v): FinancialReportValue => ({
             fpEnd: toEpochSeconds(v.fp_end) ?? 0,
             period: v.period ?? '',
-            year: toNumber(v.year ?? 0, 'year'),
-            value: toNumber(v.value ?? 0, 'value'),
+            year: toOptionalNumber(v.year) ?? 0,
+            value: toOptionalNumber(v.value) ?? 0,
             ratio: v.ratio,
             yoy: v.yoy,
           })),
@@ -541,14 +568,14 @@ export function parseInstitutionRatingResponse(output: string, symbol = ''): Ins
     const data: RawInstitutionRatingResponse = JSON.parse(output);
     const { analyst, instratings } = data;
     const dist = (d?: RawRatingDistribution): RatingDistribution => ({
-      buy: toNumber(d?.buy ?? 0, 'buy'),
-      hold: toNumber(d?.hold ?? 0, 'hold'),
-      sell: toNumber(d?.sell ?? 0, 'sell'),
+      buy: toOptionalNumber(d?.buy) ?? 0,
+      hold: toOptionalNumber(d?.hold) ?? 0,
+      sell: toOptionalNumber(d?.sell) ?? 0,
       strongBuy: toOptionalNumber(d?.strong_buy),
       noOpinion: toOptionalNumber(d?.no_opinion),
       over: toOptionalNumber(d?.over),
       under: toOptionalNumber(d?.under),
-      total: toNumber(d?.total ?? 0, 'total'),
+      total: toOptionalNumber(d?.total) ?? 0,
     });
     return {
       symbol,

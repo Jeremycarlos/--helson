@@ -197,6 +197,17 @@ describe('market-movers rules', () => {
     expect(rule.compute(makeContext({ kline: bars(3), valuation: { symbol: 'AAPL.US' } }))).toBeNull()
   })
 
+  it('high-volume skips the kline ratio when the latest bar volume is unknown', () => {
+    const rule = getScreeningStrategy('high-volume')!
+    const klines = bars(30, 100, 1, 100_000)
+    // Yesterday spiked, but today's (latest bar) volume is missing/NaN —
+    // the ratio must stay unknown instead of labelling yesterday's spike as today.
+    klines[klines.length - 2] = { ...klines[klines.length - 2], volume: 400_000 }
+    klines[klines.length - 1] = { ...klines[klines.length - 1], volume: Number.NaN }
+    const result = rule.compute(makeContext({ kline: klines, valuation: { symbol: 'AAPL.US' } }))
+    expect(result).toBeNull()
+  })
+
   it('unusual-movement flags amplitude far above the 20d average', () => {
     const rule = getScreeningStrategy('unusual-movement')!
     const klines = bars(30, 100, 0, 1_000_000) // flat: amplitude ~2% per bar
@@ -254,6 +265,28 @@ describe('fundamental rules', () => {
     )
     expect(metrics.roe).toBe(22)
     expect(metrics.revenueGrowth).toBe(12)
+  })
+
+  it('never reads the oldest period when the newest one carries no number', () => {
+    // Longbridge-style multi-period account, newest first. The newest period
+    // ships only a yoy (value unknown to the provider), so the latest usable
+    // number is Q4 2026 = 12 — the oldest 30 must never be reported as latest.
+    const report = financialReport({})
+    report.statements.IS!.indicators[0].accounts = [
+      {
+        field: 'ROE',
+        name: 'ROE',
+        values: [
+          { fpEnd: NOW_SECONDS - 86_400, period: 'Q1 2027', year: 2027, value: Number.NaN, yoy: '20' },
+          { fpEnd: NOW_SECONDS - 90 * 86_400, period: 'Q4 2026', year: 2026, value: 12 },
+          { fpEnd: NOW_SECONDS - 180 * 86_400, period: 'Q3 2026', year: 2026, value: 30 },
+        ],
+      },
+    ]
+    const metrics = extractFinancialMetrics(makeContext({ financials: report }).data)
+    expect(metrics.roe).toBe(12)
+    // 12% is below the bar; the stale 30% must not produce a candidate.
+    expect(getScreeningStrategy('high-roe')!.compute(makeContext({ financials: report }))).toBeNull()
   })
 
   it('high-dividend requires yield above the bar and cites payment history', () => {
@@ -379,6 +412,21 @@ describe('events rules', () => {
     const result = rule.compute(makeContext({ news: items }))
     expect(result?.reasons[0]).toContain('6 headlines in 7d')
     expect(rule.compute(makeContext({ news: items.slice(0, 2) }))).toBeNull()
+  })
+
+  it('uses the newest headline timestamp even when provider results are unordered', () => {
+    const rule = getScreeningStrategy('news-surge')!
+    const items = Array.from({ length: 3 }, (_, i) => ({
+      id: `n${i}`,
+      title: `headline ${i}`,
+      summary: '',
+      url: '',
+      timestamp: NOW_SECONDS - i * 86_400,
+      symbols: ['AAPL.US'],
+    }))
+    const result = rule.compute(makeContext({ news: [items[2], items[0], items[1]] }))
+
+    expect(result?.metrics.newestTimestamp).toBe(NOW_SECONDS)
   })
 
   it('dividend-events surfaces ex-dates inside the window', () => {

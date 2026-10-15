@@ -9,10 +9,17 @@
 //   fixture — deterministic local runtime (LocalRuntimeAdapter + canned market
 //             data). No LLM credentials, no network, CI-safe (spec §106).
 //   live    — real providers via the Pi runtime (credentials from env:
-//             ANTHROPIC_API_KEY / FINAGENT_PROVIDER_OVERRIDES).
+//             ANTHROPIC_API_KEY / FINAGENT_PROVIDER_OVERRIDES). Live runs
+//             execute a preflight first (Pi health, model availability,
+//             credentials, data source, judge) and refuse to report a
+//             headline score when nothing was measurable (issue #113).
 //
-// Exit codes: 0 = gate passed (or no baseline configured) with no infra
-// errors; 1 = gate regression, experiment cancelled, or an infra error.
+// Exit codes: 0 = valid run, no gate regression (or no baseline configured);
+//             1 = quality gate regression, cancelled experiment, or a usage
+//                 error (dataset/baseline/flags);
+//             2 = invalid/inconclusive execution (preflight failure, infra
+//                 errors, no valid case) — not acceptable as a benchmark;
+//             3 = cancelled before completion.
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -27,23 +34,38 @@ import { EvaluationStore } from '../../packages/shared/src/evaluation/store.ts';
 import { LocalEvaluationBackend, resolveBackend } from '../../packages/shared/src/evaluation/backend.ts';
 import { resolveLangfuseBackend } from '../../packages/shared/src/evaluation/langfuse/resolve.ts';
 import { TraceCorrelationService } from '../../packages/shared/src/evaluation/correlation.ts';
-import { createJudgeClient, resolveJudgeConfig } from '../../packages/shared/src/evaluation/judge-client.ts';
+import { createJudgeClient, resolveJudgeConfigStatus } from '../../packages/shared/src/evaluation/judge-client.ts';
 import { embeddedDatasets } from '../../packages/shared/src/evaluation/datasets/index.ts';
+import { getLongBridgeStatus } from '../../packages/longbridge-tools/src/status.ts';
+import { selectCases } from './select-cases.ts';
+import { formatPreflight, runLivePreflight, type PreflightResult } from './preflight.ts';
 import { validateGoldCaseDataset } from '../../packages/core/src/evaluation.ts';
 import {
   createBaselineFromExperiment,
   ExperimentService,
   type GateEvaluation,
 } from '../../packages/shared/src/evaluation/experiment-service.ts';
+import { isInfrastructureRun, isQualityRun } from '../../packages/shared/src/evaluation/aggregate.ts';
+import { normalizeModelSelection } from '../../packages/shared/src/evaluation/model-selection.ts';
+import { EVALUATION_METRICS } from '../../packages/core/src/index.ts';
 import type {
   EvaluationBaseline,
-  EvaluationCase,
   EvaluationDataset,
   EvaluationGoldDataset,
   EvaluationExperiment,
+  EvaluationResultRecord,
   EvaluationRun,
   ExperimentConfig,
 } from '../../packages/core/src/index.ts';
+
+// ── Exit codes (documented in USAGE) ───────────────────────────────────────
+const EXIT_OK = 0;
+/** Quality regression, or a usage error (bad dataset/baseline/flags). */
+const EXIT_FAILURE = 1;
+/** Invalid or inconclusive execution: preflight failure, infra errors, no valid case. */
+const EXIT_INVALID = 2;
+/** Experiment cancelled before completion. */
+const EXIT_CANCELLED = 3;
 
 // ── CLI flags ──────────────────────────────────────────────────────────────
 
@@ -53,6 +75,7 @@ interface CliOptions {
   mode: 'fixture' | 'live';
   model?: string;
   provider?: string;
+  thinking?: string;
   strategy?: string;
   judgeProvider?: string;
   judgeModel?: string;
@@ -60,10 +83,13 @@ interface CliOptions {
   judgeBaseUrl?: string;
   maxCases?: number;
   timeoutMs?: number;
+  caseIds?: string[];
+  tags?: string[];
   baseline?: string;
   saveBaseline?: string;
   out?: string;
   storeDir: string;
+  preflightOnly: boolean;
   help: boolean;
 }
 
@@ -74,32 +100,45 @@ const USAGE = `Usage:
 Flags:
   --dataset <id>          Embedded dataset id (default: folio-agent-v1)
   --mode fixture|live     Runtime mode (default: fixture)
-  --model <id>            Agent model under test (e.g. anthropic/claude-sonnet-4-5)
+  --model <id>            Agent model under test (e.g. anthropic/claude-sonnet-4-5;
+                          a provider prefix is split off and applied via setModel)
   --provider <id>         Agent provider override
+  --thinking <level>      Thinking level to apply to the runtime (live mode)
   --strategy <id>         Strategy/skill id to load into the runtime
   --judge-provider <id>   Judge provider (anthropic | openai-compatible)
   --judge-model <id>      Judge model (separate from the agent under test)
   --judge-api-key <key>   Judge API key (or FINAGENT_JUDGE_API_KEY)
   --judge-base-url <url>  Judge endpoint override
   --max-cases <n>         Run only the first n cases (deterministic)
+  --case <id>             Run only the named case id (repeatable; takes
+                          precedence over --smoke)
+  --tag <tag>             Run only cases carrying the tag (repeatable; a case
+                          matches any of the tags)
   --timeout-ms <n>        Per-run wall-clock budget (default 120000)
   --baseline <id>         Gate the run against a stored baseline
   --save-baseline <name>  Store the run's aggregates as a new baseline
   --out <path>            Write the full JSON artifact to <path>
   --store <path>          Eval store dir (default ~/.finagent/eval)
+  --preflight-only        Live mode: run the readiness checks and exit
+                          (0 ready, 2 not ready) without any case
   --help                  Show this help
 
+Exit codes: 0 valid · 1 quality regression / usage error · 2 invalid or
+inconclusive execution (preflight/infra) · 3 cancelled.
+
 Env: FINAGENT_JUDGE_PROVIDER/FINAGENT_JUDGE_MODEL/FINAGENT_JUDGE_API_KEY,
+FINAGENT_JUDGE_BASE_URL + FINAGENT_JUDGE_HEADERS (JSON headers for relays),
 TRACE_TO_LANGSMITH + LANGSMITH_PI_API_KEY (live LangSmith tracing),
 LANGFUSE_TRACING + LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY (+ optional LANGFUSE_HOST),
 ANTHROPIC_API_KEY or FINAGENT_PROVIDER_OVERRIDES (live agent), FINAGENT_PI_VERSION.`;
 
-function parseFlags(argv: string[]): CliOptions {
+export function parseFlags(argv: string[]): CliOptions {
   const options: CliOptions = {
     smoke: false,
     dataset: 'folio-agent-v1',
     mode: 'fixture',
     storeDir: join(homedir(), '.finagent', 'eval'),
+    preflightOnly: false,
     help: false,
   };
   const take = (flag: string, index: number): string | undefined => {
@@ -120,6 +159,9 @@ function parseFlags(argv: string[]): CliOptions {
         break;
       case '--smoke':
         options.smoke = true;
+        break;
+      case '--preflight-only':
+        options.preflightOnly = true;
         break;
       case '--dataset': {
         const next = value(name, index);
@@ -150,6 +192,14 @@ function parseFlags(argv: string[]): CliOptions {
         const next = value(name, index);
         if (next !== undefined) {
           options.provider = next;
+          index += 1;
+        }
+        break;
+      }
+      case '--thinking': {
+        const next = value(name, index);
+        if (next !== undefined) {
+          options.thinking = next;
           index += 1;
         }
         break;
@@ -201,6 +251,22 @@ function parseFlags(argv: string[]): CliOptions {
           if (!Number.isFinite(options.maxCases) || options.maxCases <= 0) {
             throw new Error(`Invalid --max-cases ${next}; expected a positive integer.`);
           }
+          index += 1;
+        }
+        break;
+      }
+      case '--case': {
+        const next = value(name, index);
+        if (next !== undefined) {
+          options.caseIds = [...(options.caseIds ?? []), next];
+          index += 1;
+        }
+        break;
+      }
+      case '--tag': {
+        const next = value(name, index);
+        if (next !== undefined) {
+          options.tags = [...(options.tags ?? []), next];
           index += 1;
         }
         break;
@@ -534,24 +600,6 @@ function createFixtureFetchers(now: () => number): MarketDataFetchers {
   };
 }
 
-// ── Dataset selection ──────────────────────────────────────────────────────
-
-/** Smoke subset (spec §70): all regression cases + golden cases until ~15. */
-function selectCases(dataset: EvaluationDataset, smoke: boolean, maxCases: number | undefined): EvaluationCase[] {
-  let cases = dataset.cases;
-  if (smoke) {
-    const regression = dataset.cases.filter((caseItem) => caseItem.difficulty === 'regression');
-    const golden = dataset.cases.filter((caseItem) => caseItem.difficulty === 'golden');
-    const target = 15;
-    const goldenBudget = Math.max(0, target - regression.length);
-    cases = [...regression, ...golden.slice(0, goldenBudget)].slice(0, target);
-  }
-  if (typeof maxCases === 'number' && maxCases > 0) {
-    return cases.slice(0, Math.floor(maxCases));
-  }
-  return cases;
-}
-
 // ── Reporting ──────────────────────────────────────────────────────────────
 
 function printCaseTable(
@@ -590,17 +638,47 @@ function printCaseTable(
   }
 }
 
-function printSummary(experiment: EvaluationExperiment, runs: EvaluationRun[], results: Array<{ verdict: string; failureModes: string[] }>): void {
+function printSummary(
+  experiment: EvaluationExperiment,
+  runs: EvaluationRun[],
+  results: EvaluationResultRecord[],
+  judgeConfigured: boolean,
+): void {
   const summary = experiment.summary;
   if (!summary) return;
-  const passed = results.filter((result) => result.verdict === 'pass').length;
+  const runById = new Map(runs.map((run) => [run.id, run]));
+  const qualityResults = results.filter((result) => {
+    const run = runById.get(result.runId);
+    return run !== undefined && isQualityRun(run);
+  });
+  const passed = qualityResults.filter((result) => result.verdict === 'pass').length;
+  const applicable = qualityResults.filter((result) => result.verdict !== 'not-applicable').length;
+  const counts = summary.execution;
   console.log('');
   console.log(`--- Summary (${experiment.id}) ---`);
-  console.log(`passRate: ${summary.passRate.toFixed(2)} (${passed}/${results.length}) · compositeScore: ${summary.compositeScore?.toFixed(3) ?? '—'}`);
+  console.log(
+    `validity: ${summary.validity}${summary.validityReasons.length > 0 ? ` (${summary.validityReasons.join(', ')})` : ''}`
+  );
+  console.log(
+    `execution: requested=${counts.requested} started=${counts.started} evaluated=${counts.evaluated} infraFailed=${counts.infraFailed} skipped=${counts.skipped}`
+  );
+  const passRate =
+    summary.passRate === null ? '— (no valid runs)' : `${summary.passRate.toFixed(2)} (${passed}/${applicable})`;
+  console.log(`passRate: ${passRate} · compositeScore: ${summary.compositeScore?.toFixed(3) ?? '—'}`);
   console.log('metric aggregates:');
   for (const aggregate of summary.metricAggregates) {
     const score = aggregate.score === null ? '—' : aggregate.score.toFixed(3);
     console.log(`  ${aggregate.metric.padEnd(24)} ${score.padStart(8)}  (n=${aggregate.sampleCount})`);
+  }
+  const judgeMetrics = EVALUATION_METRICS.filter((metric) => metric.kind === 'llm-judge').map((metric) => metric.id);
+  const measured = new Set(
+    summary.metricAggregates.filter((aggregate) => aggregate.score !== null).map((aggregate) => aggregate.metric)
+  );
+  const unmeasured = judgeMetrics.filter((metric) => !measured.has(metric));
+  if (unmeasured.length > 0) {
+    console.log(
+      `judge metrics not measured (${judgeConfigured ? 'judge produced no scores' : 'no judge configured'}): ${unmeasured.join(', ')}`
+    );
   }
   if (summary.failureModes.length > 0) {
     console.log('failure modes:');
@@ -608,9 +686,48 @@ function printSummary(experiment: EvaluationExperiment, runs: EvaluationRun[], r
       console.log(`  ${mode.mode.padEnd(24)} ${String(mode.count).padStart(4)}  (of ${mode.sampleCount} runs)`);
     }
   }
-  const infraErrors = runs.filter((run) => run.status === 'failed' && run.error !== undefined);
-  if (infraErrors.length > 0) {
-    console.log(`infra errors: ${infraErrors.length} run(s) failed at the runtime level`);
+  const infraRuns = runs.filter((run) => isInfrastructureRun(run));
+  if (infraRuns.length > 0) {
+    const byCode = new Map<string, number>();
+    for (const run of infraRuns) {
+      const code = run.error?.code ?? run.failureModes[0] ?? run.status;
+      byCode.set(code, (byCode.get(code) ?? 0) + 1);
+    }
+    console.log('infra failures:');
+    for (const [code, count] of [...byCode.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`  ${code.padEnd(24)} ${String(count).padStart(4)}`);
+    }
+  }
+}
+
+/**
+ * Requested vs effective config transparency (#114): print the runtime
+ * readback per run. Runs without an effectiveConfig are historical-unknown —
+ * labeled as such, never backfilled with the requested values.
+ */
+function printConfigSummary(config: ExperimentConfig, runs: EvaluationRun[]): void {
+  console.log('');
+  console.log('--- Config (requested vs effective) ---');
+  console.log(
+    `requested: model=${config.model ?? '—'} provider=${config.provider ?? '—'} thinking=${config.thinkingLevel ?? '—'} strategy=${config.strategyId ?? '—'}`
+  );
+  for (const run of runs) {
+    const effective = run.effectiveConfig;
+    if (!effective) {
+      console.log(`  ${run.id}: effective=unknown (no runtime readback recorded)`);
+      continue;
+    }
+    const applied = [
+      effective.model ? `${effective.provider ?? '?'}/${effective.model}` : undefined,
+      effective.thinkingLevel ? `thinking=${effective.thinkingLevel}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(', ');
+    const unapplied = (effective.unapplied ?? [])
+      .map((item) => `${item.key} not applied (${item.reason})`)
+      .join('; ');
+    const suffix = run.error ? ` · run error=${run.error.code}` : '';
+    console.log(`  ${run.id}: effective=${applied || '—'}${unapplied ? ` · ${unapplied}` : ''}${suffix}`);
   }
 }
 
@@ -663,7 +780,10 @@ async function main(): Promise<number> {
       return 1;
     }
   }
-  const cases = selectCases(dataset, options.smoke, options.maxCases);
+  const cases = selectCases(dataset, options.smoke, options.maxCases, {
+    caseIds: options.caseIds,
+    tags: options.tags,
+  });
   if (cases.length === 0) {
     console.error('No cases selected.');
     return 1;
@@ -672,20 +792,31 @@ async function main(): Promise<number> {
     `Dataset ${dataset.id}@${dataset.version} (${dataset.cases.length} cases) → running ${cases.length} case(s) in ${options.mode} mode…`
   );
 
-  // Judge: FINAGENT_JUDGE_* env or explicit flags; deterministic-only otherwise.
-  const judgeConfig = resolveJudgeConfig(process.env, {
+  // Judge: FINAGENT_JUDGE_* env or explicit flags. `resolveJudgeConfigStatus`
+  // distinguishes "not requested" from "requested but incomplete" so the live
+  // preflight can fail loudly instead of silently downgrading to
+  // deterministic-only (issue #113).
+  const judgeResolution = resolveJudgeConfigStatus(process.env, {
     provider: options.judgeProvider,
     model: options.judgeModel,
     apiKey: options.judgeApiKey,
     baseUrl: options.judgeBaseUrl,
   });
+  const judgeConfig = judgeResolution.config;
   const judgeClient = judgeConfig ? createJudgeClient(judgeConfig) : undefined;
+  const judgeReadiness = {
+    requested: judgeResolution.requested,
+    resolved: judgeConfig !== undefined,
+    provider: judgeConfig?.provider,
+    model: judgeConfig?.model,
+    missing: judgeResolution.missing,
+  };
   if (judgeClient) {
     console.log(`Judge: ${judgeClient.provider}/${judgeClient.model}`);
+  } else if (judgeResolution.requested) {
+    console.log(`Judge requested but incomplete — missing ${judgeResolution.missing.join(', ')}.`);
   } else {
-    console.log(
-      'No judge configured (set FINAGENT_JUDGE_PROVIDER/FINAGENT_JUDGE_MODEL/FINAGENT_JUDGE_API_KEY) — deterministic evaluators only.'
-    );
+    console.log('No judge configured — deterministic evaluators only; judged metrics will be reported as not measured.');
   }
 
   // Store + observability backend.
@@ -744,25 +875,72 @@ async function main(): Promise<number> {
           extensions: [],
           env: () => process.env,
           requestTimeoutMs: options.timeoutMs ?? 120_000,
+          // A cold start (first `bunx` download, CI cold cache) can take far
+          // longer than the 5s default; a health timeout there is an infra
+          // failure, not a dead runtime (issue #113).
+          healthTimeoutMs: 60_000,
         },
       });
     }
 
     const correlation = new TraceCorrelationService({ backend, store });
     const service = new ExperimentService({ store, kernel, backend, correlation });
+    // `--model provider/model-id` is a CLI shorthand: split it into the two
+    // dimensions the runtime control surface takes (setModel(provider, id))
+    // BEFORE anything touches ExperimentConfig — the prefixed id must never
+    // reach the runtime or the run metadata (#114; the same normalization
+    // #116/#122 need, kept in one place).
+    const selection = normalizeModelSelection(options.model, options.provider);
     const config: ExperimentConfig = {
       mode: options.mode,
-      model: options.model,
-      provider: options.provider,
+      model: selection.model,
+      provider: selection.provider,
+      thinkingLevel: options.thinking,
       strategyId: options.strategy,
       judgeModel: options.judgeModel ?? judgeConfig?.model,
       judgeProvider: options.judgeProvider ?? judgeConfig?.provider,
       maxCases: options.maxCases,
       timeoutMs: options.timeoutMs,
     };
-    // A `--model provider/model` shorthand implies the provider.
-    if (config.model && !config.provider && config.model.includes('/')) {
-      config.provider = config.model.split('/')[0];
+
+    // Live preflight (issue #113): nothing runs until the runtime, model,
+    // credentials, data source, and requested judge are proven ready. A
+    // missing install/credential is an explicit invalid state, never a suite
+    // that "ran" with zero tool calls.
+    let preflight: PreflightResult | undefined;
+    if (options.mode === 'live') {
+      preflight = await runLivePreflight({
+        provider: config.provider,
+        model: config.model,
+        judge: judgeReadiness,
+        llm: kernel.getLlmApi(),
+        dataSource: getLongBridgeStatus,
+      });
+      console.log(formatPreflight(preflight));
+      if (!preflight.ok) {
+        await writeArtifact(options.out, {
+          preflight,
+          experiment: null,
+          runs: [],
+          results: [],
+          exitCode: EXIT_INVALID,
+        });
+        console.error('Live preflight failed — the suite is not valid; no cases were run.');
+        return EXIT_INVALID;
+      }
+      if (options.preflightOnly) {
+        console.log('Preflight only — no cases were run.');
+        return EXIT_OK;
+      }
+      // The preflight probe already switched the runtime to this model; apply
+      // it explicitly so every case runs against the validated model instead
+      // of Pi's ambient default (issue #113). A failure here is fatal.
+      if (config.provider && config.model) {
+        await kernel.getLlmApi()?.setModel(config.provider, config.model);
+      }
+    } else if (options.preflightOnly) {
+      console.error('--preflight-only is only valid with --mode live.');
+      return EXIT_FAILURE;
     }
 
     const storeBaseline = options.baseline
@@ -795,56 +973,91 @@ async function main(): Promise<number> {
     }
     const results = await store.listResults(experiment.id);
     printCaseTable(runs, results);
-    printSummary(experiment, runs, results);
+    printSummary(experiment, runs, results, judgeClient !== undefined);
+    printConfigSummary(config, runs);
 
-    // Baseline handling: gate against an existing baseline (store, then the
-    // committed scripts/eval/ci-baselines/<id>.json), optionally store one.
+    // Baseline handling: a gate comparison only makes sense on a fully valid
+    // run. Invalid/inconclusive experiments keep their diagnostics but never
+    // emit a passing headline or a stored baseline (issue #113).
     let regressions: GateEvaluation['regressions'] | undefined;
     let gatePassed = true;
-    if (options.baseline) {
+    if (options.baseline && experiment.summary?.validity === 'valid') {
       const baseline =
         (await store.listBaselines()).find((entry) => entry.id === options.baseline) ??
         (await loadCommittedBaseline(options.baseline));
       if (!baseline) {
         console.error(`Baseline not found: ${options.baseline}`);
-        return 1;
+        return EXIT_FAILURE;
       }
-      if (!experiment.summary) throw new Error('Experiment finished without a summary.');
       const gate = service.evaluateGate(experiment.summary, baseline);
       regressions = gate.regressions;
       gatePassed = gate.passed;
       printGate(experiment, regressions, gatePassed);
     }
+
+    let exitCode = EXIT_OK;
+    if (experiment.status === 'cancelled') {
+      exitCode = EXIT_CANCELLED;
+    } else if (experiment.summary?.validity !== 'valid') {
+      exitCode = EXIT_INVALID;
+    } else if (options.baseline && !gatePassed) {
+      exitCode = EXIT_FAILURE;
+    }
+
     if (options.saveBaseline) {
-      const baseline = await createBaselineFromExperiment(store, experiment, options.saveBaseline);
-      console.log(`Saved baseline ${baseline.id} (${baseline.name})`);
+      if (experiment.summary?.validity !== 'valid') {
+        console.error(
+          `Refusing to save baseline '${options.saveBaseline}': execution validity is ` +
+            `'${experiment.summary?.validity ?? 'unknown'}' (${experiment.summary?.validityReasons.join(', ') || 'n/a'}).`
+        );
+        exitCode = EXIT_INVALID;
+      } else {
+        const baseline = await createBaselineFromExperiment(store, experiment, options.saveBaseline);
+        console.log(`Saved baseline ${baseline.id} (${baseline.name})`);
+      }
     }
 
     if (options.out) {
-      await writeFile(
-        options.out,
-        JSON.stringify(
-          { experiment, runs, results, regressions, gatePassed: options.baseline ? gatePassed : undefined },
-          null,
-          2,
-        ),
-      );
-      console.log(`Artifact written to ${resolve(options.out)}`);
+      await writeArtifact(options.out, {
+        experiment,
+        runs,
+        results,
+        regressions,
+        gatePassed: options.baseline && experiment.summary?.validity === 'valid' ? gatePassed : undefined,
+        preflight,
+        validity: experiment.summary?.validity,
+        execution: experiment.summary?.execution,
+        exitCode,
+      });
     }
 
     if (experiment.status === 'cancelled') {
       console.error('Experiment cancelled (aborted).');
-      return 1;
+      return exitCode;
     }
-    if (options.baseline && !gatePassed) {
+    if (exitCode === EXIT_INVALID) {
+      console.error(
+        `Execution validity: ${experiment.summary?.validity ?? 'unknown'} ` +
+          `(${experiment.summary?.validityReasons.join(', ') || 'no valid runs'}) — not acceptable as a benchmark.`
+      );
+      return exitCode;
+    }
+    if (exitCode === EXIT_FAILURE) {
       console.error('Regression gate failed — exit 1.');
-      return 1;
+      return exitCode;
     }
-    return 0;
+    return exitCode;
   } finally {
     await kernel?.dispose();
     await rm(runtimeDir, { recursive: true, force: true }).catch(() => undefined);
   }
+}
+
+/** Write the JSON artifact when requested; never throws on a missing path. */
+async function writeArtifact(path: string | undefined, payload: unknown): Promise<void> {
+  if (!path) return;
+  await writeFile(path, JSON.stringify(payload, null, 2));
+  console.log(`Artifact written to ${resolve(path)}`);
 }
 
 /**
@@ -874,5 +1087,9 @@ async function loadCommittedBaseline(id: string): Promise<EvaluationBaseline | u
   }
 }
 
-const exitCode = await main();
-process.exit(exitCode);
+// Testable as a module (#114 chain test imports parseFlags without running
+// the CLI); executes only when invoked directly.
+if (import.meta.main) {
+  const exitCode = await main();
+  process.exit(exitCode);
+}

@@ -86,7 +86,13 @@ export function buildQuoteAnswerBlocks(
     .filter((kline) => Number.isFinite(kline.close) && Number.isFinite(kline.timestamp))
     .sort((a, b) => a.timestamp - b.timestamp)
     .slice(-30)
-    .map((kline) => ({ t: new Date(kline.timestamp).toISOString(), v: kline.close }));
+    // Repo convention: Kline.timestamp is epoch SECONDS (see toIso) — passing
+    // it to `new Date()` directly rendered every chart point in Jan 1970.
+    .map((kline) => {
+      const t = toIso(kline.timestamp);
+      return t === undefined ? undefined : { t, v: kline.close };
+    })
+    .filter((point): point is { t: string; v: number } => point !== undefined);
   if (series.length >= 2) {
     const chart: TimeSeriesChartBlock = {
       version: 1,
@@ -191,7 +197,8 @@ export function buildRiskComparisonBlock(
 
 /** Annualized-agnostic daily-return standard deviation over closes. */
 export function dailyVolatility(klines: Kline[] | undefined): number | null {
-  const closes = (klines ?? [])
+  const closes = [...(klines ?? [])]
+    .sort((a, b) => a.timestamp - b.timestamp)
     .map((kline) => kline.close)
     .filter((value) => Number.isFinite(value) && value > 0);
   if (closes.length < 3) return null;

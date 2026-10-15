@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import type {
   AutomationRule,
   AutomationRun,
+  AutomationScopeKind,
+  AutomationScopeSnapshot,
   CalendarEvent,
   CapabilityRegistry,
   NotificationEvent,
@@ -44,8 +46,12 @@ export interface MaterialSignals {
 /** True when any signal crosses the materiality bar. */
 export function signalsAreMaterial(signals: MaterialSignals): boolean {
   if (signals.diffMaterial || signals.ratingChanged || signals.earningsAnnounced) return true
+  // Number.isFinite also rejects NaN produced by dirty quotes — a NaN move
+  // must read as "no usable signal", never as a crossed bar (issue #185).
   return (
-    signals.priceMovePct !== undefined && signals.priceMovePct >= MATERIAL_PRICE_MOVE_PCT
+    signals.priceMovePct !== undefined &&
+    Number.isFinite(signals.priceMovePct) &&
+    signals.priceMovePct >= MATERIAL_PRICE_MOVE_PCT
   )
 }
 
@@ -59,6 +65,8 @@ export interface AutomationRunContext {
   /** Scope providers — the kernel host wires these (UI atoms / stored scope). */
   watchlistSymbols?: () => string[] | Promise<string[]>
   portfolioSymbols?: () => string[] | Promise<string[]>
+  /** A portfolio scope plus the timestamp of the source snapshot it came from. */
+  portfolioSnapshot?: () => Promise<{ symbols: string[]; fetchedAt: number } | null>
   thesisSymbols?: () => string[] | Promise<string[]>
   /** Earnings-event hook scope for pre/post-earnings rules. */
   symbols?: string[]
@@ -77,11 +85,25 @@ export async function runAutomation(
 ): Promise<AutomationRun> {
   const ranAt = ctx.now?.() ?? Date.now()
   const id = ctx.idGen?.() ?? randomUUID()
-  const symbols = await resolveScope(rule, ctx)
+  const resolvedScope = await resolveScope(rule, ctx, ranAt)
+  const symbols = resolvedScope.snapshot.symbols
 
   const failures: string[] = []
+  // Subset of `failures` that decides completeness/outcome: problems with the
+  // scope or the materiality evaluation itself. Delivery-side problems
+  // (research/notification) are recorded in `failures` only, so one noisy OS
+  // notification failure cannot degrade a decided run into incomplete and
+  // silently drop it from the daily brief (issue #185).
+  const evaluationFailures: string[] = []
+  const fail = (message: string, decisive = true) => {
+    failures.push(message)
+    if (decisive) evaluationFailures.push(message)
+  }
+  if (resolvedScope.failure !== undefined) fail(resolvedScope.failure)
   if (symbols.length === 0) {
-    failures.push(`no symbols in scope for ${rule.type}`)
+    if (resolvedScope.failure === undefined) {
+      fail(`no symbols in scope for ${rule.type}`)
+    }
   }
 
   let evaluated = 0
@@ -91,23 +113,50 @@ export async function runAutomation(
 
   for (const raw of symbols) {
     const symbol = raw.trim().toUpperCase()
-    const outcome = await evaluateSymbol(symbol, ctx)
-    if (outcome === null) {
-      failures.push(`${symbol}: quote unavailable`)
+    let evaluation: { signals: MaterialSignals; quote: Quote; probeFailed?: boolean } | null
+    try {
+      evaluation = await evaluateSymbol(symbol, ctx)
+    } catch {
+      fail(`${symbol}: evaluation failed`)
+      continue
+    }
+    if (evaluation === null) {
+      fail(`${symbol}: quote unavailable`)
       continue
     }
     evaluated += 1
-    const material = signalsAreMaterial(outcome.signals)
+    if (!Number.isFinite(evaluation.signals.priceMovePct)) {
+      fail(`${symbol}: previous close unavailable`)
+    }
+    if (evaluation.probeFailed === true) {
+      fail(`${symbol}: earnings calendar probe failed`)
+    }
+    const material = signalsAreMaterial(evaluation.signals)
     if (material) {
       materialChanges += 1
-      analyzed += 1
-      await ctx.researchStart(symbol, rule.strategyId)
+      try {
+        await ctx.researchStart(symbol, rule.strategyId)
+        analyzed += 1
+      } catch {
+        fail(`${symbol}: research analysis failed`, false)
+      }
     }
     if (rule.notify === 'all' || material) {
-      await ctx.notify?.(notificationFor(rule, symbol, material, outcome.signals, ranAt, ctx.locale))
-      notified = true
+      try {
+        await ctx.notify?.(notificationFor(rule, symbol, material, evaluation.signals, ranAt, ctx.locale))
+        notified = true
+      } catch {
+        fail(`${symbol}: notification failed`, false)
+      }
     }
   }
+
+  const complete = symbols.length > 0 && evaluated === symbols.length && evaluationFailures.length === 0
+  const outcome: AutomationRun['outcome'] = complete
+    ? materialChanges > 0
+      ? 'material_update'
+      : 'no_material_update'
+    : 'incomplete'
 
   return {
     id,
@@ -118,33 +167,97 @@ export async function runAutomation(
     analyzed,
     notified,
     failures,
+    outcome,
+    scopeSnapshot: resolvedScope.snapshot,
   }
 }
 
 /** Symbols the rule monitors: rule override → hook scope → type providers. */
-async function resolveScope(rule: AutomationRule, ctx: AutomationRunContext): Promise<string[]> {
-  if (rule.symbols !== undefined && rule.symbols.length > 0) return rule.symbols
-  if (ctx.symbols !== undefined && ctx.symbols.length > 0) return ctx.symbols
+async function resolveScope(
+  rule: AutomationRule,
+  ctx: AutomationRunContext,
+  capturedAt: number
+): Promise<{ snapshot: AutomationScopeSnapshot; failure?: string }> {
+  if (rule.symbols !== undefined && rule.symbols.length > 0) {
+    return { snapshot: makeScopeSnapshot('rule', rule.symbols, capturedAt) }
+  }
+  if (ctx.symbols !== undefined && ctx.symbols.length > 0) {
+    return { snapshot: makeScopeSnapshot('hook', ctx.symbols, capturedAt) }
+  }
   switch (rule.type) {
     case 'watchlist-daily-review':
-      return (await ctx.watchlistSymbols?.()) ?? []
-    case 'portfolio-daily-brief':
-      return (await ctx.portfolioSymbols?.()) ?? []
+      return resolveProviderScope('watchlist', ctx.watchlistSymbols, capturedAt)
+    case 'portfolio-daily-brief': {
+      if (ctx.portfolioSnapshot !== undefined) {
+        try {
+          const portfolio = await ctx.portfolioSnapshot()
+          if (portfolio === null || !Number.isFinite(portfolio.fetchedAt)) {
+            return {
+              snapshot: makeScopeSnapshot('portfolio', [], capturedAt),
+              failure: 'portfolio snapshot unavailable',
+            }
+          }
+          return {
+            snapshot: makeScopeSnapshot('portfolio', portfolio.symbols, capturedAt, portfolio.fetchedAt),
+          }
+        } catch {
+          return {
+            snapshot: makeScopeSnapshot('portfolio', [], capturedAt),
+            failure: 'portfolio snapshot unavailable',
+          }
+        }
+      }
+      return resolveProviderScope('portfolio', ctx.portfolioSymbols, capturedAt)
+    }
     case 'weekly-thesis-review':
-      return (await ctx.thesisSymbols?.()) ?? []
+      return resolveProviderScope('thesis', ctx.thesisSymbols, capturedAt)
     default:
-      return []
+      return { snapshot: makeScopeSnapshot('hook', [], capturedAt) }
+  }
+}
+
+function resolveProviderScope(
+  kind: AutomationScopeKind,
+  provider: (() => string[] | Promise<string[]>) | undefined,
+  capturedAt: number
+): Promise<{ snapshot: AutomationScopeSnapshot; failure?: string }> {
+  return Promise.resolve()
+    .then(() => provider?.() ?? [])
+    .then((symbols) => ({ snapshot: makeScopeSnapshot(kind, symbols, capturedAt) }))
+    .catch(() => ({
+      snapshot: makeScopeSnapshot(kind, [], capturedAt),
+      failure: `${kind} scope unavailable`,
+    }))
+}
+
+function makeScopeSnapshot(
+  kind: AutomationScopeKind,
+  symbols: string[],
+  capturedAt: number,
+  sourceFetchedAt?: number
+): AutomationScopeSnapshot {
+  const normalizedSymbols = [
+    ...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean)),
+  ].sort()
+  return {
+    kind,
+    symbols: normalizedSymbols,
+    capturedAt,
+    ...(sourceFetchedAt !== undefined ? { sourceFetchedAt } : {}),
   }
 }
 
 /**
  * Lightweight refresh for one symbol. Returns null (symbol skipped) only when
- * the quote itself is unavailable; optional probes degrade to no-signal.
+ * the quote itself is unavailable. The optional calendar probe degrades to
+ * no-signal when the capability is absent; a failing probe call is surfaced
+ * via `probeFailed` so the run can distinguish "no event" from "could not
+ * probe" instead of silently reading an error as no signal (issue #185).
  */
 async function evaluateSymbol(
   symbol: string,
   ctx: AutomationRunContext
-): Promise<{ signals: MaterialSignals; quote: Quote } | null> {
+): Promise<{ signals: MaterialSignals; quote: Quote; probeFailed?: boolean } | null> {
   const quote = await fetchQuote(symbol, ctx)
   if (quote === null) return null
   const diff = await ctx.diffRepo.getBySymbol(symbol)
@@ -152,10 +265,17 @@ async function evaluateSymbol(
     priceMovePct: priceMovePct(quote),
     diffMaterial: diff?.material === true,
     ratingChanged: hasMaterialRatingChange(diff),
-    earningsAnnounced:
-      hasNewEarnings(diff) || (await calendarProbe(symbol, ctx)),
+    earningsAnnounced: hasNewEarnings(diff),
   }
-  return { signals, quote }
+  let probeFailed = false
+  if (!signals.earningsAnnounced) {
+    try {
+      signals.earningsAnnounced = await calendarProbe(symbol, ctx)
+    } catch {
+      probeFailed = true
+    }
+  }
+  return { signals, quote, probeFailed }
 }
 
 async function fetchQuote(symbol: string, ctx: AutomationRunContext): Promise<Quote | null> {
@@ -170,33 +290,46 @@ async function fetchQuote(symbol: string, ctx: AutomationRunContext): Promise<Qu
 }
 
 /**
- * Calendar probe: a `report`/`financial` event dated on/before today means an
- * earnings announcement the research diff may not cover yet. Degrades to
- * no-signal when the capability is absent or the call fails.
+ * Calendar probe: a `report`/`financial` event dated within the last 7 days
+ * means an earnings announcement the research diff may not cover yet. Without
+ * the freshness lower bound, any historical event still sitting in the "recent
+ * 5" list kept `earningsAnnounced` true forever, re-triggering research and
+ * notifications every single day (#168). The capability being absent degrades
+ * to no-signal; a failing call throws so the run can record a probe failure
+ * rather than silently reporting "no event" (issue #185).
  */
+const EARNINGS_PROBE_WINDOW_SECONDS = 7 * 86_400;
+
 async function calendarProbe(symbol: string, ctx: AutomationRunContext): Promise<boolean> {
   const cap = ctx.registry.get('research.events')
   if (!cap) return false
-  try {
-    const result = await cap.execute(
-      { eventType: 'report', symbols: [symbol], count: 5 },
-      { now: ctx.now }
-    )
-    const events = result.data as CalendarEvent[]
-    const nowSeconds = (ctx.now?.() ?? Date.now()) / 1000
-    return events.some(
-      (event) => (event.type === 'report' || event.type === 'financial') && event.date <= nowSeconds
-    )
-  } catch {
-    return false
-  }
+  const result = await cap.execute(
+    { eventType: 'report', symbols: [symbol], count: 5 },
+    { now: ctx.now }
+  )
+  const events = result.data as CalendarEvent[]
+  const nowSeconds = (ctx.now?.() ?? Date.now()) / 1000
+  return events.some(
+    (event) =>
+      (event.type === 'report' || event.type === 'financial') &&
+      event.date <= nowSeconds &&
+      event.date > nowSeconds - EARNINGS_PROBE_WINDOW_SECONDS
+  )
 }
 
-/** Abs percent move vs previous close; undefined when prevClose is unusable. */
+/**
+ * Abs percent move vs previous close; undefined when either price is unusable.
+ * Dirty data can carry NaN — a NaN move must read as "unusable baseline"
+ * (→ recorded failure), not as a silent no-signal (issue #185).
+ */
 function priceMovePct(quote: Quote): number | undefined {
+  const lastPrice = quote.lastPrice
   const prevClose = quote.prevClose
-  if (!Number.isFinite(prevClose) || prevClose <= 0) return undefined
-  return (Math.abs(quote.lastPrice - prevClose) / prevClose) * 100
+  if (!Number.isFinite(lastPrice) || !Number.isFinite(prevClose) || prevClose <= 0) {
+    return undefined
+  }
+  const pct = (Math.abs(lastPrice - prevClose) / prevClose) * 100
+  return Number.isFinite(pct) ? pct : undefined
 }
 
 function hasMaterialRatingChange(diff: ResearchDiff | undefined): boolean {

@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { getEventListeners } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import type {
   AccountAssets,
@@ -163,6 +164,28 @@ describe('ProviderRouter.execute', () => {
     expect(second.ok && second.provenance.providerId).toBe('fallback');
   });
 
+  it('collects every supporting provider for reconciliation', async () => {
+    const router = new ProviderRouter();
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['company.financials'], async () =>
+        success('primary', 'Primary', { value: 100 })
+      )
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['company.financials'], async () =>
+        success('fallback', 'Fallback', { value: 130 })
+      )
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const results = await router.executeAll<{ value: number }>('company.financials', {});
+    expect(results).toHaveLength(2);
+    expect(results.filter((result) => result.ok).map((result) => result.ok && result.provenance.providerId)).toEqual([
+      'primary',
+      'fallback',
+    ]);
+  });
+
   it('returns the primary result on success', async () => {
     const router = new ProviderRouter();
     let fallbackCalls = 0;
@@ -281,6 +304,101 @@ describe('ProviderRouter.execute', () => {
     expect(primaryCalls).toBe(0);
   });
 
+  it('removes external abort listeners after successful calls on a shared signal', async () => {
+    const router = new ProviderRouter({ timeoutMs: 100 });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        success('primary', 'Primary', { value: 'p' })
+      )
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    for (let i = 0; i < 12; i += 1) {
+      const result = await router.execute('market.quote', {}, controller.signal);
+      expect(result.ok).toBe(true);
+    }
+
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes external abort listeners when a provider fails', async () => {
+    const router = new ProviderRouter({ timeoutMs: 100 });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () =>
+        failure('NETWORK_ERROR', 'provider failed')
+      )
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    const result = await router.execute('market.quote', {}, controller.signal);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('NETWORK_ERROR');
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes external abort listeners when a provider times out', async () => {
+    const router = new ProviderRouter({ timeoutMs: 5 });
+    let releaseProvider!: () => void;
+    const providerPending = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async () => {
+        await providerPending;
+        return success('primary', 'Primary', { value: 'late' });
+      })
+    );
+    router.setRouting({ primary: 'primary' });
+
+    const controller = new AbortController();
+    const result = await router.execute('market.quote', {}, controller.signal);
+    releaseProvider();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('TIMEOUT');
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('removes external abort listeners and skips fallback after an in-flight abort', async () => {
+    const router = new ProviderRouter({ timeoutMs: 100 });
+    const started = Promise.withResolvers<void>();
+    let fallbackCalls = 0;
+    router.register(
+      new FakeFinancialDataProvider('primary', 'Primary', ['market.quote'], async (_cap, _input, signal) => {
+        started.resolve();
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) {
+            resolve();
+            return;
+          }
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return failure('ABORTED', 'aborted');
+      })
+    );
+    router.register(
+      new FakeFinancialDataProvider('fallback', 'Fallback', ['market.quote'], async () => {
+        fallbackCalls += 1;
+        return success('fallback', 'Fallback', { value: 'f' });
+      })
+    );
+    router.setRouting({ primary: 'primary', fallback: 'fallback' });
+
+    const controller = new AbortController();
+    const pending = router.execute('market.quote', {}, controller.signal);
+    await started.promise;
+    controller.abort();
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe('ABORTED');
+    expect(fallbackCalls).toBe(0);
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+  });
+
   it('returns the last error when all candidates fail', async () => {
     const router = new ProviderRouter();
     router.register(
@@ -375,6 +493,22 @@ describe('ProviderRouter.coverage + capabilityMapping', () => {
     expect(mapping.get('market.depth')).toEqual(['fallback']);
   });
 });
+
+/**
+ * JsonFileStore whose reads yield before completing, widening the
+ * read-modify-write window so that a lost-update regression interleaves
+ * deterministically under Promise.all (issue #145).
+ */
+class SlowReadJsonFileStore extends JsonFileStore {
+  constructor(dir: string, private readonly delayMs: number) {
+    super(dir);
+  }
+
+  override async read<T>(file: string, fallback: T): Promise<T> {
+    await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    return super.read<T>(file, fallback);
+  }
+}
 
 describe('ConnectionStore', () => {
   let dir = '';
@@ -497,6 +631,59 @@ describe('ConnectionStore', () => {
     expect((await connections.getConfig('massive'))?.endpoint).toBe(
       'https://api.example.com/v1?symbol=AAPL'
     );
+  });
+
+  it('serializes concurrent setConfig so no provider config is silently dropped (issue #145)', async () => {
+    const connections = new ConnectionStore(new SlowReadJsonFileStore(dir, 20));
+    await Promise.all([
+      connections.setConfig('massive', {
+        enabled: true,
+        endpoint: 'https://a.example',
+        region: 'US',
+      }),
+      connections.setConfig('longbridge', {
+        enabled: false,
+        endpoint: 'https://b.example',
+        region: 'HK',
+      }),
+    ]);
+    const file = await store.read<{
+      connections: unknown[];
+      configs?: Record<string, Record<string, unknown>>;
+    }>('connections.json', { connections: [] });
+    expect(Object.keys(file.configs ?? {}).sort()).toEqual(['longbridge', 'massive']);
+    expect(file.configs?.massive).toMatchObject({ enabled: true, region: 'US' });
+    expect(file.configs?.longbridge).toMatchObject({ enabled: false, region: 'HK' });
+  });
+
+  it('serializes concurrent update and setConfig so both land (issue #145)', async () => {
+    const connections = new ConnectionStore(new SlowReadJsonFileStore(dir, 20));
+    await Promise.all([
+      connections.setConfig('massive', { enabled: true }),
+      connections.update({ providerId: 'massive', status: 'connected', lastCheck: 1 }),
+    ]);
+    const file = await store.read<{
+      connections: { providerId: string }[];
+      configs?: Record<string, Record<string, unknown>>;
+    }>('connections.json', { connections: [] });
+    expect(file.connections).toHaveLength(1);
+    expect(file.connections[0]?.providerId).toBe('massive');
+    expect(file.configs?.massive).toMatchObject({ enabled: true });
+  });
+
+  it('serializes concurrent setRouting and setConfig so both land (issue #145)', async () => {
+    const connections = new ConnectionStore(new SlowReadJsonFileStore(dir, 20));
+    await Promise.all([
+      connections.setConfig('massive', { enabled: true }),
+      connections.setRouting({ primary: 'massive', fallback: 'longbridge' }),
+    ]);
+    const file = await store.read<{
+      connections: unknown[];
+      configs?: Record<string, Record<string, unknown>>;
+      routing?: Record<string, string>;
+    }>('connections.json', { connections: [] });
+    expect(file.configs?.massive).toMatchObject({ enabled: true });
+    expect(file.routing).toMatchObject({ primary: 'massive', fallback: 'longbridge' });
   });
 });
 

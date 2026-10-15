@@ -58,6 +58,8 @@ bun run eval:full                 # entire dataset, fixture mode
 bun run eval:smoke -- --mode live --model anthropic/claude-sonnet-4-5
 bun run eval:full  -- --baseline <id>
 bun run eval:smoke -- --save-baseline release-candidate --out ./eval.json
+bun run eval:smoke -- --case fv1-market-001 --case fv1-market-002
+bun run eval:smoke -- --tag provider-failure --max-cases 3
 ```
 
 Flags:
@@ -73,24 +75,44 @@ Flags:
 | `--judge-model <id>` | Judge model, separate from the agent under test |
 | `--judge-api-key <key>` | Judge API key |
 | `--max-cases <n>` | Run only the first n cases (deterministic) |
+| `--case <id>` | Run only the named case id; repeatable |
+| `--tag <tag>` | Run only cases carrying the tag; repeatable, a case matches any tag |
 | `--timeout-ms <n>` | Per-run wall-clock budget (default 120000) |
 | `--baseline <id>` | Gate the run against a stored baseline |
 | `--save-baseline <name>` | Store the run's aggregates as a new baseline |
 | `--out <path>` | Write the full JSON artifact to `<path>` |
 | `--store <path>` | Eval store dir (default `~/.finagent/eval`) |
+| `--preflight-only` | Live mode: run readiness checks and exit (0 ready / 2 not ready) without any case |
 
 **Modes.** `fixture` uses the deterministic local runtime (`LocalRuntimeAdapter`)
 with canned per-symbol market data — no LLM credentials, no network, CI-safe
 (spec §106). `live` uses the Pi runtime with real providers; credentials come
-from env (`ANTHROPIC_API_KEY` or `FINAGENT_PROVIDER_OVERRIDES`).
+from env (`ANTHROPIC_API_KEY` or `FINAGENT_PROVIDER_OVERRIDES`), and an
+**explicit `--model <provider>/<id>` is required**. Every live run starts with a
+preflight (issue #113) that checks the Pi runtime, model availability, model
+credentials (one-token prompt), the LongBridge data source, and judge readiness
+before any case runs; failures are reported with status only (never secrets)
+and exit `2` without running the suite.
 
 **Judges.** Configure the judge separately with
 `FINAGENT_JUDGE_PROVIDER` / `FINAGENT_JUDGE_MODEL` / `FINAGENT_JUDGE_API_KEY`
 (or the `--judge-*` flags). Without a judge the run uses deterministic
-evaluators only (a notice is printed).
+evaluators only and the summary explicitly lists the unmeasured judge metrics.
+A judge that was requested but is missing settings fails the live preflight
+instead of silently downgrading.
 
-**Exit codes.** `0` = gate passed (or no baseline configured) with no infra
-errors; `1` = gate regression, experiment cancelled, or a runtime error.
+**Validity vs quality (issue #113).** The summary reports execution validity
+separately from quality: `execution` carries
+requested/started/evaluated/infra-failed/skipped counts, and `validity` is
+`valid` only when every requested case produced a completed, evaluated run.
+`invalid` (no valid run) and `inconclusive` (partial infrastructure failure,
+judge errors, skipped cases) experiments keep per-case diagnostics but expose
+no headline composite and cannot seed a baseline.
+
+**Exit codes.** `0` = valid run, no gate regression (or no baseline
+configured); `1` = quality gate regression or a usage error (dataset/baseline/
+flags); `2` = invalid or inconclusive execution (live preflight failure, infra
+errors, no valid case); `3` = cancelled.
 
 **Cost guardrails (spec §79).** Use `--max-cases` for a small first pass and
 `--timeout-ms` to bound each run before spending on a full live run.
@@ -100,6 +122,8 @@ errors; `1` = gate regression, experiment cancelled, or a runtime error.
 | Variable | Meaning |
 |---|---|
 | `FINAGENT_JUDGE_PROVIDER` / `FINAGENT_JUDGE_MODEL` / `FINAGENT_JUDGE_API_KEY` | Judge credentials (CLI); see also `--judge-*` flags |
+| `FINAGENT_JUDGE_BASE_URL` | Judge endpoint override (falls back to `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`) |
+| `FINAGENT_JUDGE_HEADERS` | JSON object of extra judge HTTP headers (relays/gateways that need routing/session headers) |
 | `TRACE_TO_LANGSMITH` | `true`/`1` enables LangSmith tracing (live mode) |
 | `LANGSMITH_PI_API_KEY` | LangSmith API key (falls back to `LANGSMITH_API_KEY`) |
 | `LANGSMITH_PI_PROJECT` / `LANGSMITH_PI_ENDPOINT` | LangSmith project / endpoint overrides |
